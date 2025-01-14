@@ -39,9 +39,14 @@ a path separator); paths use the forward slash '/' as separator.
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
 	DisableAutoGenTag: true,
+	GroupID:           cmdGroupDefault,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		return runLs(cmd.Context(), lsOptions, globalOptions, args)
 	},
@@ -70,41 +75,40 @@ func init() {
 }
 
 type lsPrinter interface {
-	Snapshot(sn *restic.Snapshot)
-	Node(path string, node *restic.Node)
-	LeaveDir(path string)
-	Close()
+	Snapshot(sn *restic.Snapshot) error
+	Node(path string, node *restic.Node, isPrefixDirectory bool) error
+	LeaveDir(path string) error
+	Close() error
 }
 
 type jsonLsPrinter struct {
 	enc *json.Encoder
 }
 
-func (p *jsonLsPrinter) Snapshot(sn *restic.Snapshot) {
+func (p *jsonLsPrinter) Snapshot(sn *restic.Snapshot) error {
 	type lsSnapshot struct {
 		*restic.Snapshot
-		ID         *restic.ID `json:"id"`
-		ShortID    string     `json:"short_id"`
-		StructType string     `json:"struct_type"` // "snapshot"
+		ID          *restic.ID `json:"id"`
+		ShortID     string     `json:"short_id"`
+		MessageType string     `json:"message_type"` // "snapshot"
+		StructType  string     `json:"struct_type"`  // "snapshot", deprecated
 	}
 
-	err := p.enc.Encode(lsSnapshot{
-		Snapshot:   sn,
-		ID:         sn.ID(),
-		ShortID:    sn.ID().Str(),
-		StructType: "snapshot",
+	return p.enc.Encode(lsSnapshot{
+		Snapshot:    sn,
+		ID:          sn.ID(),
+		ShortID:     sn.ID().Str(),
+		MessageType: "snapshot",
+		StructType:  "snapshot",
 	})
-	if err != nil {
-		Warnf("JSON encode failed: %v\n", err)
-	}
 }
 
 // Print node in our custom JSON format, followed by a newline.
-func (p *jsonLsPrinter) Node(path string, node *restic.Node) {
-	err := lsNodeJSON(p.enc, path, node)
-	if err != nil {
-		Warnf("JSON encode failed: %v\n", err)
+func (p *jsonLsPrinter) Node(path string, node *restic.Node, isPrefixDirectory bool) error {
+	if isPrefixDirectory {
+		return nil
 	}
+	return lsNodeJSON(p.enc, path, node)
 }
 
 func lsNodeJSON(enc *json.Encoder, path string, node *restic.Node) error {
@@ -121,12 +125,13 @@ func lsNodeJSON(enc *json.Encoder, path string, node *restic.Node) error {
 		AccessTime  time.Time   `json:"atime,omitempty"`
 		ChangeTime  time.Time   `json:"ctime,omitempty"`
 		Inode       uint64      `json:"inode,omitempty"`
-		StructType  string      `json:"struct_type"` // "node"
+		MessageType string      `json:"message_type"` // "node"
+		StructType  string      `json:"struct_type"`  // "node", deprecated
 
 		size uint64 // Target for Size pointer.
 	}{
 		Name:        node.Name,
-		Type:        node.Type,
+		Type:        string(node.Type),
 		Path:        path,
 		UID:         node.UID,
 		GID:         node.GID,
@@ -137,19 +142,20 @@ func lsNodeJSON(enc *json.Encoder, path string, node *restic.Node) error {
 		AccessTime:  node.AccessTime,
 		ChangeTime:  node.ChangeTime,
 		Inode:       node.Inode,
+		MessageType: "node",
 		StructType:  "node",
 	}
 	// Always print size for regular files, even when empty,
 	// but never for other types.
-	if node.Type == "file" {
+	if node.Type == restic.NodeTypeFile {
 		n.Size = &n.size
 	}
 
 	return enc.Encode(n)
 }
 
-func (p *jsonLsPrinter) LeaveDir(_ string) {}
-func (p *jsonLsPrinter) Close()            {}
+func (p *jsonLsPrinter) LeaveDir(_ string) error { return nil }
+func (p *jsonLsPrinter) Close() error            { return nil }
 
 type ncduLsPrinter struct {
 	out   io.Writer
@@ -159,16 +165,17 @@ type ncduLsPrinter struct {
 // lsSnapshotNcdu prints a restic snapshot in Ncdu save format.
 // It opens the JSON list. Nodes are added with lsNodeNcdu and the list is closed by lsCloseNcdu.
 // Format documentation: https://dev.yorhel.nl/ncdu/jsonfmt
-func (p *ncduLsPrinter) Snapshot(sn *restic.Snapshot) {
+func (p *ncduLsPrinter) Snapshot(sn *restic.Snapshot) error {
 	const NcduMajorVer = 1
 	const NcduMinorVer = 2
 
 	snapshotBytes, err := json.Marshal(sn)
 	if err != nil {
-		Warnf("JSON encode failed: %v\n", err)
+		return err
 	}
 	p.depth++
-	fmt.Fprintf(p.out, "[%d, %d, %s", NcduMajorVer, NcduMinorVer, string(snapshotBytes))
+	_, err = fmt.Fprintf(p.out, "[%d, %d, %s, [{\"name\":\"/\"}", NcduMajorVer, NcduMinorVer, string(snapshotBytes))
+	return err
 }
 
 func lsNcduNode(_ string, node *restic.Node) ([]byte, error) {
@@ -186,14 +193,17 @@ func lsNcduNode(_ string, node *restic.Node) ([]byte, error) {
 		Mtime  int64  `json:"mtime"`
 	}
 
+	const blockSize = 512
+
 	outNode := NcduNode{
-		Name:   node.Name,
-		Asize:  node.Size,
-		Dsize:  node.Size,
+		Name:  node.Name,
+		Asize: node.Size,
+		// round up to nearest full blocksize
+		Dsize:  (node.Size + blockSize - 1) / blockSize * blockSize,
 		Dev:    node.DeviceID,
 		Ino:    node.Inode,
 		NLink:  node.Links,
-		NotReg: node.Type != "dir" && node.Type != "file",
+		NotReg: node.Type != restic.NodeTypeDir && node.Type != restic.NodeTypeFile,
 		UID:    node.UID,
 		GID:    node.GID,
 		Mode:   uint16(node.Mode & os.ModePerm),
@@ -209,31 +219,38 @@ func lsNcduNode(_ string, node *restic.Node) ([]byte, error) {
 	if node.Mode&os.ModeSticky != 0 {
 		outNode.Mode |= 0o1000
 	}
+	if outNode.Mtime < 0 {
+		// ncdu does not allow negative times
+		outNode.Mtime = 0
+	}
 
 	return json.Marshal(outNode)
 }
 
-func (p *ncduLsPrinter) Node(path string, node *restic.Node) {
+func (p *ncduLsPrinter) Node(path string, node *restic.Node, _ bool) error {
 	out, err := lsNcduNode(path, node)
 	if err != nil {
-		Warnf("JSON encode failed: %v\n", err)
+		return err
 	}
 
-	if node.Type == "dir" {
-		fmt.Fprintf(p.out, ",\n%s[\n%s%s", strings.Repeat("  ", p.depth), strings.Repeat("  ", p.depth+1), string(out))
+	if node.Type == restic.NodeTypeDir {
+		_, err = fmt.Fprintf(p.out, ",\n%s[\n%s%s", strings.Repeat("  ", p.depth), strings.Repeat("  ", p.depth+1), string(out))
 		p.depth++
 	} else {
-		fmt.Fprintf(p.out, ",\n%s%s", strings.Repeat("  ", p.depth), string(out))
+		_, err = fmt.Fprintf(p.out, ",\n%s%s", strings.Repeat("  ", p.depth), string(out))
 	}
+	return err
 }
 
-func (p *ncduLsPrinter) LeaveDir(_ string) {
+func (p *ncduLsPrinter) LeaveDir(_ string) error {
 	p.depth--
-	fmt.Fprintf(p.out, "\n%s]", strings.Repeat("  ", p.depth))
+	_, err := fmt.Fprintf(p.out, "\n%s]", strings.Repeat("  ", p.depth))
+	return err
 }
 
-func (p *ncduLsPrinter) Close() {
-	fmt.Fprint(p.out, "\n]\n")
+func (p *ncduLsPrinter) Close() error {
+	_, err := fmt.Fprint(p.out, "\n]\n]\n")
+	return err
 }
 
 type textLsPrinter struct {
@@ -242,15 +259,23 @@ type textLsPrinter struct {
 	HumanReadable bool
 }
 
-func (p *textLsPrinter) Snapshot(sn *restic.Snapshot) {
+func (p *textLsPrinter) Snapshot(sn *restic.Snapshot) error {
 	Verbosef("%v filtered by %v:\n", sn, p.dirs)
+	return nil
 }
-func (p *textLsPrinter) Node(path string, node *restic.Node) {
-	Printf("%s\n", formatNode(path, node, p.ListLong, p.HumanReadable))
+func (p *textLsPrinter) Node(path string, node *restic.Node, isPrefixDirectory bool) error {
+	if !isPrefixDirectory {
+		Printf("%s\n", formatNode(path, node, p.ListLong, p.HumanReadable))
+	}
+	return nil
 }
 
-func (p *textLsPrinter) LeaveDir(_ string) {}
-func (p *textLsPrinter) Close()            {}
+func (p *textLsPrinter) LeaveDir(_ string) error {
+	return nil
+}
+func (p *textLsPrinter) Close() error {
+	return nil
+}
 
 func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []string) error {
 	if len(args) == 0 {
@@ -305,10 +330,11 @@ func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []stri
 		return false
 	}
 
-	repo, err := OpenRepository(ctx, gopts)
+	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
 	snapshotLister, err := restic.MemorizeList(ctx, repo, restic.SnapshotFile)
 	if err != nil {
@@ -352,7 +378,9 @@ func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []stri
 		return err
 	}
 
-	printer.Snapshot(sn)
+	if err := printer.Snapshot(sn); err != nil {
+		return err
+	}
 
 	processNode := func(_ restic.ID, nodepath string, node *restic.Node, err error) error {
 		if err != nil {
@@ -362,9 +390,13 @@ func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []stri
 			return nil
 		}
 
+		printedDir := false
 		if withinDir(nodepath) {
-			// if we're within a dir, print the node
-			printer.Node(nodepath, node)
+			// if we're within a target path, print the node
+			if err := printer.Node(nodepath, node, false); err != nil {
+				return err
+			}
+			printedDir = true
 
 			// if recursive listing is requested, signal the walker that it
 			// should continue walking recursively
@@ -376,12 +408,22 @@ func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []stri
 		// if there's an upcoming match deeper in the tree (but we're not
 		// there yet), signal the walker to descend into any subdirs
 		if approachingMatchingTree(nodepath) {
+			// print node leading up to the target paths
+			if !printedDir {
+				return printer.Node(nodepath, node, true)
+			}
 			return nil
 		}
 
 		// otherwise, signal the walker to not walk recursively into any
 		// subdirs
-		if node.Type == "dir" {
+		if node.Type == restic.NodeTypeDir {
+			// immediately generate leaveDir if the directory is skipped
+			if printedDir {
+				if err := printer.LeaveDir(nodepath); err != nil {
+					return err
+				}
+			}
 			return walker.ErrSkipNode
 		}
 		return nil
@@ -389,11 +431,12 @@ func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []stri
 
 	err = walker.Walk(ctx, repo, *sn.Tree, walker.WalkVisitor{
 		ProcessNode: processNode,
-		LeaveDir: func(path string) {
+		LeaveDir: func(path string) error {
 			// the root path `/` has no corresponding node and is thus also skipped by processNode
-			if withinDir(path) && path != "/" {
-				printer.LeaveDir(path)
+			if path != "/" {
+				return printer.LeaveDir(path)
 			}
+			return nil
 		},
 	})
 
@@ -401,6 +444,5 @@ func runLs(ctx context.Context, opts LsOptions, gopts GlobalOptions, args []stri
 		return err
 	}
 
-	printer.Close()
-	return nil
+	return printer.Close()
 }

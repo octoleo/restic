@@ -1,11 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"os"
 
-	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/errors"
 	"github.com/restic/restic/internal/repository"
 	"github.com/restic/restic/internal/restic"
@@ -17,15 +17,17 @@ var cmdRepairPacks = &cobra.Command{
 	Use:   "packs [packIDs...]",
 	Short: "Salvage damaged pack files",
 	Long: `
-WARNING: The CLI for this command is experimental and will likely change in the future!
-
 The "repair packs" command extracts intact blobs from the specified pack files, rebuilds
 the index to remove the damaged pack files and removes the pack files from the repository.
 
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command was successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 `,
 	DisableAutoGenTag: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
@@ -40,13 +42,6 @@ func init() {
 }
 
 func runRepairPacks(ctx context.Context, gopts GlobalOptions, term *termstatus.Terminal, args []string) error {
-	// FIXME discuss and add proper feature flag mechanism
-	flag, _ := os.LookupEnv("RESTIC_FEATURES")
-	if flag != "repair-packs-v1" {
-		return errors.Fatal("This command is experimental and may change/be removed without notice between restic versions. " +
-			"Set the environment variable 'RESTIC_FEATURES=repair-packs-v1' to enable it.")
-	}
-
 	ids := restic.NewIDSet()
 	for _, arg := range args {
 		id, err := restic.ParseID(arg)
@@ -59,41 +54,37 @@ func runRepairPacks(ctx context.Context, gopts GlobalOptions, term *termstatus.T
 		return errors.Fatal("no ids specified")
 	}
 
-	repo, err := OpenRepository(ctx, gopts)
+	ctx, repo, unlock, err := openWithExclusiveLock(ctx, gopts, false)
 	if err != nil {
 		return err
 	}
+	defer unlock()
 
-	lock, ctx, err := lockRepoExclusive(ctx, repo, gopts.RetryLock, gopts.JSON)
-	defer unlockRepo(lock)
-	if err != nil {
-		return err
-	}
+	printer := newTerminalProgressPrinter(gopts.verbosity, term)
 
-	bar := newIndexProgress(gopts.Quiet, gopts.JSON)
+	bar := newIndexTerminalProgress(gopts.Quiet, gopts.JSON, term)
 	err = repo.LoadIndex(ctx, bar)
 	if err != nil {
 		return errors.Fatalf("%s", err)
 	}
 
-	printer := newTerminalProgressPrinter(gopts.verbosity, term)
-
 	printer.P("saving backup copies of pack files to current folder")
 	for id := range ids {
+		buf, err := repo.LoadRaw(ctx, restic.PackFile, id)
+		// corrupted data is fine
+		if buf == nil {
+			return err
+		}
+
 		f, err := os.OpenFile("pack-"+id.String(), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o666)
 		if err != nil {
 			return err
 		}
-
-		err = repo.Backend().Load(ctx, backend.Handle{Type: restic.PackFile, Name: id.String()}, 0, 0, func(rd io.Reader) error {
-			_, err := f.Seek(0, 0)
-			if err != nil {
-				return err
-			}
-			_, err = io.Copy(f, rd)
+		if _, err := io.Copy(f, bytes.NewReader(buf)); err != nil {
+			_ = f.Close()
 			return err
-		})
-		if err != nil {
+		}
+		if err := f.Close(); err != nil {
 			return err
 		}
 	}
