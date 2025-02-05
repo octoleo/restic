@@ -5,13 +5,15 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/restic/restic/internal/filter"
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
+	"github.com/restic/restic/internal/ui"
 )
 
 func testRunRewriteExclude(t testing.TB, gopts GlobalOptions, excludes []string, forget bool, metadata snapshotMetadataArgs) {
 	opts := RewriteOptions{
-		excludePatternOptions: excludePatternOptions{
+		ExcludePatternOptions: filter.ExcludePatternOptions{
 			Excludes: excludes,
 		},
 		Forget:   forget,
@@ -31,6 +33,24 @@ func createBasicRewriteRepo(t testing.TB, env *testEnvironment) restic.ID {
 	testRunCheck(t, env.gopts)
 
 	return snapshotIDs[0]
+}
+
+func getSnapshot(t testing.TB, snapshotID restic.ID, env *testEnvironment) *restic.Snapshot {
+	t.Helper()
+
+	ctx, repo, unlock, err := openWithReadLock(context.TODO(), env.gopts, false)
+	rtest.OK(t, err)
+	defer unlock()
+
+	snapshots, err := restic.TestLoadAllSnapshots(ctx, repo, nil)
+	rtest.OK(t, err)
+
+	for _, s := range snapshots {
+		if *s.ID() == snapshotID {
+			return s
+		}
+	}
+	return nil
 }
 
 func TestRewrite(t *testing.T) {
@@ -63,10 +83,21 @@ func TestRewriteReplace(t *testing.T) {
 	defer cleanup()
 	snapshotID := createBasicRewriteRepo(t, env)
 
+	snapshot := getSnapshot(t, snapshotID, env)
+
 	// exclude some data
 	testRunRewriteExclude(t, env.gopts, []string{"3"}, true, snapshotMetadataArgs{Hostname: "", Time: ""})
+	bytesExcluded, err := ui.ParseBytes("16K")
+	rtest.OK(t, err)
+
 	newSnapshotIDs := testListSnapshots(t, env.gopts, 1)
 	rtest.Assert(t, snapshotID != newSnapshotIDs[0], "snapshot id should have changed")
+
+	newSnapshot := getSnapshot(t, newSnapshotIDs[0], env)
+
+	rtest.Equals(t, snapshot.Summary.TotalFilesProcessed-1, newSnapshot.Summary.TotalFilesProcessed, "snapshot file count should have changed")
+	rtest.Equals(t, snapshot.Summary.TotalBytesProcessed-uint64(bytesExcluded), newSnapshot.Summary.TotalBytesProcessed, "snapshot size should have changed")
+
 	// check forbids unused blobs, thus remove them first
 	testRunPrune(t, env.gopts, PruneOptions{MaxUnused: "0"})
 	testRunCheck(t, env.gopts)
@@ -78,8 +109,11 @@ func testRewriteMetadata(t *testing.T, metadata snapshotMetadataArgs) {
 	createBasicRewriteRepo(t, env)
 	testRunRewriteExclude(t, env.gopts, []string{}, true, metadata)
 
-	repo, _ := OpenRepository(context.TODO(), env.gopts)
-	snapshots, err := restic.TestLoadAllSnapshots(context.TODO(), repo, nil)
+	ctx, repo, unlock, err := openWithReadLock(context.TODO(), env.gopts, false)
+	rtest.OK(t, err)
+	defer unlock()
+
+	snapshots, err := restic.TestLoadAllSnapshots(ctx, repo, nil)
 	rtest.OK(t, err)
 	rtest.Assert(t, len(snapshots) == 1, "expected one snapshot, got %v", len(snapshots))
 	newSnapshot := snapshots[0]
@@ -104,4 +138,37 @@ func TestRewriteMetadata(t *testing.T) {
 	} {
 		testRewriteMetadata(t, metadata)
 	}
+}
+
+func TestRewriteSnaphotSummary(t *testing.T) {
+	env, cleanup := withTestEnvironment(t)
+	defer cleanup()
+	createBasicRewriteRepo(t, env)
+
+	rtest.OK(t, runRewrite(context.TODO(), RewriteOptions{SnapshotSummary: true}, env.gopts, []string{}))
+	// no new snapshot should be created as the snapshot already has a summary
+	snapshots := testListSnapshots(t, env.gopts, 1)
+
+	// replace snapshot by one without a summary
+	_, repo, unlock, err := openWithExclusiveLock(context.TODO(), env.gopts, false)
+	rtest.OK(t, err)
+	sn, err := restic.LoadSnapshot(context.TODO(), repo, snapshots[0])
+	rtest.OK(t, err)
+	oldSummary := sn.Summary
+	sn.Summary = nil
+	rtest.OK(t, repo.RemoveUnpacked(context.TODO(), restic.WriteableSnapshotFile, snapshots[0]))
+	snapshots[0], err = restic.SaveSnapshot(context.TODO(), repo, sn)
+	rtest.OK(t, err)
+	unlock()
+
+	// rewrite snapshot and lookup ID of new snapshot
+	rtest.OK(t, runRewrite(context.TODO(), RewriteOptions{SnapshotSummary: true}, env.gopts, []string{}))
+	newSnapshots := testListSnapshots(t, env.gopts, 2)
+	newSnapshot := restic.NewIDSet(newSnapshots...).Sub(restic.NewIDSet(snapshots...)).List()[0]
+
+	sn, err = restic.LoadSnapshot(context.TODO(), repo, newSnapshot)
+	rtest.OK(t, err)
+	rtest.Assert(t, sn.Summary != nil, "snapshot should have summary attached")
+	rtest.Equals(t, oldSummary.TotalBytesProcessed, sn.Summary.TotalBytesProcessed, "unexpected TotalBytesProcessed value")
+	rtest.Equals(t, oldSummary.TotalFilesProcessed, sn.Summary.TotalFilesProcessed, "unexpected TotalFilesProcessed value")
 }
