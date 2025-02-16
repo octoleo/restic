@@ -16,6 +16,7 @@ import (
 	"github.com/restic/restic/internal/backend"
 	"github.com/restic/restic/internal/crypto"
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/repository/index"
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
@@ -84,6 +85,53 @@ func BenchmarkSortCachedPacksFirst(b *testing.B) {
 	}
 }
 
+func BenchmarkLoadIndex(b *testing.B) {
+	BenchmarkAllVersions(b, benchmarkLoadIndex)
+}
+
+func benchmarkLoadIndex(b *testing.B, version uint) {
+	TestUseLowSecurityKDFParameters(b)
+
+	repo, _, be := TestRepositoryWithVersion(b, version)
+	idx := index.NewIndex()
+
+	for i := 0; i < 5000; i++ {
+		idx.StorePack(restic.NewRandomID(), []restic.Blob{
+			{
+				BlobHandle: restic.NewRandomBlobHandle(),
+				Length:     1234,
+				Offset:     1235,
+			},
+		})
+	}
+	idx.Finalize()
+
+	id, err := idx.SaveIndex(context.TODO(), &internalRepository{repo})
+	rtest.OK(b, err)
+
+	b.Logf("index saved as %v", id.Str())
+	fi, err := be.Stat(context.TODO(), backend.Handle{Type: restic.IndexFile, Name: id.String()})
+	rtest.OK(b, err)
+	b.Logf("filesize is %v", fi.Size)
+
+	b.ResetTimer()
+
+	for i := 0; i < b.N; i++ {
+		_, err := loadIndex(context.TODO(), repo, id)
+		rtest.OK(b, err)
+	}
+}
+
+// loadIndex loads the index id from backend and returns it.
+func loadIndex(ctx context.Context, repo restic.LoaderUnpacked, id restic.ID) (*index.Index, error) {
+	buf, err := repo.LoadUnpacked(ctx, restic.IndexFile, id)
+	if err != nil {
+		return nil, err
+	}
+
+	return index.DecodeIndex(buf, id)
+}
+
 // buildPackfileWithoutHeader returns a manually built pack file without a header.
 func buildPackfileWithoutHeader(blobSizes []int, key *crypto.Key, compress bool) (blobs []restic.Blob, packfile []byte) {
 	opts := []zstd.EOption{
@@ -146,14 +194,14 @@ func TestStreamPack(t *testing.T) {
 }
 
 func testStreamPack(t *testing.T, version uint) {
-	// always use the same key for deterministic output
-	const jsonKey = `{"mac":{"k":"eQenuI8adktfzZMuC8rwdA==","r":"k8cfAly2qQSky48CQK7SBA=="},"encrypt":"MKO9gZnRiQFl8mDUurSDa9NMjiu9MUifUrODTHS05wo="}`
-
-	var key crypto.Key
-	err := json.Unmarshal([]byte(jsonKey), &key)
+	dec, err := zstd.NewReader(nil)
 	if err != nil {
-		t.Fatal(err)
+		panic(dec)
 	}
+	defer dec.Close()
+
+	// always use the same key for deterministic output
+	key := testKey(t)
 
 	blobSizes := []int{
 		5522811,
@@ -276,7 +324,7 @@ func testStreamPack(t *testing.T, version uint) {
 
 				loadCalls = 0
 				shortFirstLoad = test.shortFirstLoad
-				err = streamPack(ctx, load, &key, restic.ID{}, test.blobs, handleBlob)
+				err := streamPack(ctx, load, nil, dec, &key, restic.ID{}, test.blobs, handleBlob)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -339,7 +387,7 @@ func testStreamPack(t *testing.T, version uint) {
 					return err
 				}
 
-				err = streamPack(ctx, load, &key, restic.ID{}, test.blobs, handleBlob)
+				err := streamPack(ctx, load, nil, dec, &key, restic.ID{}, test.blobs, handleBlob)
 				if err == nil {
 					t.Fatalf("wanted error %v, got nil", test.err)
 				}
@@ -353,7 +401,7 @@ func testStreamPack(t *testing.T, version uint) {
 }
 
 func TestBlobVerification(t *testing.T) {
-	repo := TestRepository(t).(*Repository)
+	repo := TestRepository(t)
 
 	type DamageType string
 	const (
@@ -402,7 +450,7 @@ func TestBlobVerification(t *testing.T) {
 }
 
 func TestUnpackedVerification(t *testing.T) {
-	repo := TestRepository(t).(*Repository)
+	repo := TestRepository(t)
 
 	type DamageType string
 	const (
@@ -448,4 +496,84 @@ func TestUnpackedVerification(t *testing.T) {
 			rtest.Assert(t, strings.Contains(err.Error(), test.msg), "expected error to contain %q, got %q", test.msg, err)
 		}
 	}
+}
+
+func testKey(t *testing.T) crypto.Key {
+	const jsonKey = `{"mac":{"k":"eQenuI8adktfzZMuC8rwdA==","r":"k8cfAly2qQSky48CQK7SBA=="},"encrypt":"MKO9gZnRiQFl8mDUurSDa9NMjiu9MUifUrODTHS05wo="}`
+
+	var key crypto.Key
+	err := json.Unmarshal([]byte(jsonKey), &key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
+}
+
+func TestStreamPackFallback(t *testing.T) {
+	dec, err := zstd.NewReader(nil)
+	if err != nil {
+		panic(dec)
+	}
+	defer dec.Close()
+
+	test := func(t *testing.T, failLoad bool) {
+		key := testKey(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		plaintext := rtest.Random(800, 42)
+		blobID := restic.Hash(plaintext)
+		blobs := []restic.Blob{
+			{
+				Length: uint(crypto.CiphertextLength(len(plaintext))),
+				Offset: 0,
+				BlobHandle: restic.BlobHandle{
+					ID:   blobID,
+					Type: restic.DataBlob,
+				},
+			},
+		}
+
+		var loadPack backendLoadFn
+		if failLoad {
+			loadPack = func(ctx context.Context, h backend.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
+				return errors.New("load error")
+			}
+		} else {
+			loadPack = func(ctx context.Context, h backend.Handle, length int, offset int64, fn func(rd io.Reader) error) error {
+				// just return an empty array to provoke an error
+				data := make([]byte, length)
+				return fn(bytes.NewReader(data))
+			}
+		}
+
+		loadBlob := func(ctx context.Context, t restic.BlobType, id restic.ID, buf []byte) ([]byte, error) {
+			if id == blobID {
+				return plaintext, nil
+			}
+			return nil, errors.New("unknown blob")
+		}
+
+		blobOK := false
+		handleBlob := func(blob restic.BlobHandle, buf []byte, err error) error {
+			rtest.OK(t, err)
+			rtest.Equals(t, blobID, blob.ID)
+			rtest.Equals(t, plaintext, buf)
+			blobOK = true
+			return err
+		}
+
+		err := streamPack(ctx, loadPack, loadBlob, dec, &key, restic.ID{}, blobs, handleBlob)
+		rtest.OK(t, err)
+		rtest.Assert(t, blobOK, "blob failed to load")
+	}
+
+	t.Run("corrupted blob", func(t *testing.T) {
+		test(t, false)
+	})
+
+	// test fallback for failed pack loading
+	t.Run("failed load", func(t *testing.T) {
+		test(t, true)
+	})
 }

@@ -113,6 +113,34 @@ The following steps are necessary to build the binaries:
         restic/builder \
         go run helpers/build-release-binaries/main.go --version 0.14.0 --verbose
 
+Verifying SLSA Provenance for Docker Images
+*******************************************
+
+Our Docker images are built with SLSA (Supply-chain Levels for Software Artifacts)
+provenance. 
+
+To verify this provenance:
+
+1. Install the `slsa-verifier` tool from https://github.com/slsa-framework/slsa-verifier
+
+2. Run the following command:
+
+   .. code-block:: console
+
+      $ slsa-verifier verify-image \
+        --source-uri github.com/restic/restic \
+        <image-name>@<digest>
+
+   Replace `<tag>` with the Git tag of the release you're verifying, `<image-name>`
+   with the full name of the Docker image (including the registry), and `<digest>`
+   with the SHA256 digest of the image.
+
+3. If the verification is successful, you'll see output indicating that the provenance 
+is valid.
+
+This verification ensures that the Docker image was built by our official GitHub
+Actions workflow and has not been tampered with since its creation.
+
 Verifying the Official Binaries
 *******************************
 
@@ -123,7 +151,7 @@ The specified go compiler version must match the one used to build the official
 binaries. For example, for restic 0.16.2 the command would be
 ``helpers/verify-release-binaries.sh 0.16.2 1.21.3``.
 
-The script requires bash, curl, docker, git, gpg, shasum and tar.
+The script requires bash, curl, docker (version >= 25.0), git, gpg, shasum and tar.
 
 The script first downloads all release binaries, checks the SHASUM256 file and its
 signature. Afterwards it checks that the tarball matches the restic git repository

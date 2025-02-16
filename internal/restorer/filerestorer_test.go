@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/restic/restic/internal/errors"
+	"github.com/restic/restic/internal/feature"
 	"github.com/restic/restic/internal/restic"
 	rtest "github.com/restic/restic/internal/test"
 )
@@ -23,6 +24,11 @@ type TestFile struct {
 	blobs []TestBlob
 }
 
+type TestWarmupJob struct {
+	handlesCount int
+	waitCalled   bool
+}
+
 type TestRepo struct {
 	packsIDToData map[restic.ID][]byte
 
@@ -31,17 +37,34 @@ type TestRepo struct {
 	files              []*fileInfo
 	filesPathToContent map[string]string
 
+	warmupJobs []*TestWarmupJob
+
 	//
 	loader blobsLoaderFn
 }
 
-func (i *TestRepo) Lookup(bh restic.BlobHandle) []restic.PackedBlob {
-	packs := i.blobs[bh.ID]
+func (i *TestRepo) Lookup(tpe restic.BlobType, id restic.ID) []restic.PackedBlob {
+	packs := i.blobs[id]
 	return packs
 }
 
 func (i *TestRepo) fileContent(file *fileInfo) string {
 	return i.filesPathToContent[file.location]
+}
+
+func (i *TestRepo) StartWarmup(ctx context.Context, packs restic.IDSet) (restic.WarmupJob, error) {
+	job := TestWarmupJob{handlesCount: len(packs)}
+	i.warmupJobs = append(i.warmupJobs, &job)
+	return &job, nil
+}
+
+func (job *TestWarmupJob) HandleCount() int {
+	return job.handlesCount
+}
+
+func (job *TestWarmupJob) Wait(_ context.Context) error {
+	job.waitCalled = true
+	return nil
 }
 
 func newTestRepo(content []TestFile) *TestRepo {
@@ -111,6 +134,7 @@ func newTestRepo(content []TestFile) *TestRepo {
 		blobs:              blobs,
 		files:              files,
 		filesPathToContent: filesPathToContent,
+		warmupJobs:         []*TestWarmupJob{},
 	}
 	repo.loader = func(ctx context.Context, packID restic.ID, blobs []restic.Blob, handleBlobFn func(blob restic.BlobHandle, buf []byte, err error) error) error {
 		blobs = append([]restic.Blob{}, blobs...)
@@ -141,10 +165,12 @@ func newTestRepo(content []TestFile) *TestRepo {
 }
 
 func restoreAndVerify(t *testing.T, tempdir string, content []TestFile, files map[string]bool, sparse bool) {
+	defer feature.TestSetFlag(t, feature.Flag, feature.S3Restore, true)()
+
 	t.Helper()
 	repo := newTestRepo(content)
 
-	r := newFileRestorer(tempdir, repo.loader, repo.Lookup, 2, sparse, nil)
+	r := newFileRestorer(tempdir, repo.loader, repo.Lookup, 2, sparse, false, repo.StartWarmup, nil)
 
 	if files == nil {
 		r.files = repo.files
@@ -177,6 +203,15 @@ func verifyRestore(t *testing.T, r *fileRestorer, repo *TestRepo) {
 			t.Errorf("file %v has wrong content: want %q, got %q", file.location, content, data)
 		}
 	}
+
+	if len(repo.warmupJobs) == 0 {
+		t.Errorf("warmup did not occur")
+	}
+	for i, warmupJob := range repo.warmupJobs {
+		if !warmupJob.waitCalled {
+			t.Errorf("warmup job %d was not waited", i)
+		}
+	}
 }
 
 func TestFileRestorerBasic(t *testing.T) {
@@ -205,6 +240,10 @@ func TestFileRestorerBasic(t *testing.T) {
 					{"data3-1", "pack3-1"},
 					{"data3-1", "pack3-1"},
 				},
+			},
+			{
+				name:  "empty",
+				blobs: []TestBlob{},
 			},
 		}, nil, sparse)
 	}
@@ -281,7 +320,7 @@ func TestErrorRestoreFiles(t *testing.T) {
 		return loadError
 	}
 
-	r := newFileRestorer(tempdir, repo.loader, repo.Lookup, 2, false, nil)
+	r := newFileRestorer(tempdir, repo.loader, repo.Lookup, 2, false, false, repo.StartWarmup, nil)
 	r.files = repo.files
 
 	err := r.restoreFiles(context.TODO())
@@ -322,7 +361,7 @@ func TestFatalDownloadError(t *testing.T) {
 		})
 	}
 
-	r := newFileRestorer(tempdir, repo.loader, repo.Lookup, 2, false, nil)
+	r := newFileRestorer(tempdir, repo.loader, repo.Lookup, 2, false, false, repo.StartWarmup, nil)
 	r.files = repo.files
 
 	var errors []string

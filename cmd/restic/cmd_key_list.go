@@ -12,10 +12,11 @@ import (
 	"github.com/spf13/cobra"
 )
 
-var cmdKeyList = &cobra.Command{
-	Use:   "list",
-	Short: "List keys (passwords)",
-	Long: `
+func newKeyListCommand() *cobra.Command {
+	cmd := &cobra.Command{
+		Use:   "list",
+		Short: "List keys (passwords)",
+		Long: `
 The "list" sub-command lists all the keys (passwords) associated with the repository.
 Returns the key ID, username, hostname, created time and if it's the current key being
 used to access the repository.
@@ -23,16 +24,18 @@ used to access the repository.
 EXIT STATUS
 ===========
 
-Exit status is 0 if the command is successful, and non-zero if there was any error.
+Exit status is 0 if the command was successful.
+Exit status is 1 if there was any error.
+Exit status is 10 if the repository does not exist.
+Exit status is 11 if the repository is already locked.
+Exit status is 12 if the password is incorrect.
 	`,
-	DisableAutoGenTag: true,
-	RunE: func(cmd *cobra.Command, args []string) error {
-		return runKeyList(cmd.Context(), globalOptions, args)
-	},
-}
-
-func init() {
-	cmdKey.AddCommand(cmdKeyList)
+		DisableAutoGenTag: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runKeyList(cmd.Context(), globalOptions, args)
+		},
+	}
+	return cmd
 }
 
 func runKeyList(ctx context.Context, gopts GlobalOptions, args []string) error {
@@ -40,19 +43,11 @@ func runKeyList(ctx context.Context, gopts GlobalOptions, args []string) error {
 		return fmt.Errorf("the key list command expects no arguments, only options - please see `restic help key list` for usage and flags")
 	}
 
-	repo, err := OpenRepository(ctx, gopts)
+	ctx, repo, unlock, err := openWithReadLock(ctx, gopts, gopts.NoLock)
 	if err != nil {
 		return err
 	}
-
-	if !gopts.NoLock {
-		var lock *restic.Lock
-		lock, ctx, err = lockRepo(ctx, repo, gopts.RetryLock, gopts.JSON)
-		defer unlockRepo(lock)
-		if err != nil {
-			return err
-		}
-	}
+	defer unlock()
 
 	return listKeys(ctx, repo, gopts)
 }
@@ -61,6 +56,7 @@ func listKeys(ctx context.Context, s *repository.Repository, gopts GlobalOptions
 	type keyInfo struct {
 		Current  bool   `json:"current"`
 		ID       string `json:"id"`
+		ShortID  string `json:"-"`
 		UserName string `json:"userName"`
 		HostName string `json:"hostName"`
 		Created  string `json:"created"`
@@ -69,7 +65,7 @@ func listKeys(ctx context.Context, s *repository.Repository, gopts GlobalOptions
 	var m sync.Mutex
 	var keys []keyInfo
 
-	err := restic.ParallelList(ctx, s, restic.KeyFile, s.Connections(), func(ctx context.Context, id restic.ID, size int64) error {
+	err := restic.ParallelList(ctx, s, restic.KeyFile, s.Connections(), func(ctx context.Context, id restic.ID, _ int64) error {
 		k, err := repository.LoadKey(ctx, s, id)
 		if err != nil {
 			Warnf("LoadKey() failed: %v\n", err)
@@ -78,7 +74,8 @@ func listKeys(ctx context.Context, s *repository.Repository, gopts GlobalOptions
 
 		key := keyInfo{
 			Current:  id == s.KeyID(),
-			ID:       id.Str(),
+			ID:       id.String(),
+			ShortID:  id.Str(),
 			UserName: k.Username,
 			HostName: k.Hostname,
 			Created:  k.Created.Local().Format(TimeFormat),
@@ -99,7 +96,7 @@ func listKeys(ctx context.Context, s *repository.Repository, gopts GlobalOptions
 	}
 
 	tab := table.New()
-	tab.AddColumn(" ID", "{{if .Current}}*{{else}} {{end}}{{ .ID }}")
+	tab.AddColumn(" ID", "{{if .Current}}*{{else}} {{end}}{{ .ShortID }}")
 	tab.AddColumn("User", "{{ .UserName }}")
 	tab.AddColumn("Host", "{{ .HostName }}")
 	tab.AddColumn("Created", "{{ .Created }}")
